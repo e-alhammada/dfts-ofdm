@@ -1,8 +1,12 @@
 """dfts_day5.py - DFT-s-OFDM link, Day 5 step 1: AWGN + per-subcarrier LMMSE (perfect CSI).
 
-Sanity check: flat channel h = [1] at Es/N0 = 14 dB must match Gray 16-QAM AWGN theory.
+Step 1: flat channel h = [1] at Es/N0 = 14 dB matches Gray 16-QAM AWGN theory.
+Step 2: BER vs Es/N0 (>= 100 bit errors per point), flat and 3-tap channels.
 Reuses the Day 4 transmitter and receiver blocks.
 """
+import matplotlib
+matplotlib.use("Agg")                     # file output only (plt.show() hangs in your terminal)
+import matplotlib.pyplot as plt
 import numpy as np
 from scipy.signal import lfilter
 from scipy.special import erfc
@@ -61,18 +65,55 @@ def theory_16qam(esn0_db):
     return ber, ser
 
 
-if __name__ == "__main__":
-    snr_db, n_slots, seed = 14.0, 10, 1
-    ber_th, ser_th = theory_16qam(snr_db)
+def sinr_eff_db(snr_db, h):
+    """Post-despreading SINR of unbiased LMMSE: mu/(1-mu), mu = mean |H|^2/(|H|^2 + sigma2)."""
+    H2 = np.abs(np.fft.fft(h, N_FFT)[BINS[:M]]) ** 2
+    s2 = 10 ** (-np.atleast_1d(snr_db)[:, None] / 10)
+    mu = np.mean(H2 / (H2 + s2), axis=1)
+    return 10 * np.log10(mu / (1 - mu))
 
-    for name, h in [("flat h=[1]", np.array([1.0])),
-                    ("3-tap", np.array([0.8, 0.5, 0.3]) / np.linalg.norm([0.8, 0.5, 0.3]))]:
-        rng = np.random.default_rng(seed)
-        be = se = 0
-        for _ in range(n_slots):
-            b, s = run_slot(snr_db, h, rng)
-            be, se = be + b, se + s
-        ber, ser = be / (n_slots * BITS_PER_SLOT), se / (n_slots * BITS_PER_SLOT // 4)
-        print(f"{name:11s} Es/N0 {snr_db} dB: BER {ber:.3e} ({be} errors), ratio {ber / ber_th:.3f};"
-              f"  SER {ser:.3e}, ratio {ser / ser_th:.3f}")
-    print(f"theory (AWGN): BER {ber_th:.3e}, SER {ser_th:.3e}")
+
+def ber_point(snr_db, h, rng, min_err=500, max_slots=5000):
+    """Run slots until min_err bit errors (or max_slots). Returns (BER, bit errors, bits)."""
+    errors = slots = 0
+    while errors < min_err and slots < max_slots:
+        b, _ = run_slot(snr_db, h, rng)
+        errors += b
+        slots += 1
+    n_bits = slots * BITS_PER_SLOT
+    return errors / n_bits, errors, n_bits
+
+
+if __name__ == "__main__":
+    snr_list = np.arange(0, 19, 2)                       # Es/N0 in dB
+    h3 = np.array([0.8, 0.5, 0.3]) / np.linalg.norm([0.8, 0.5, 0.3])
+    channels = {"flat": np.array([1.0]), "3tap": h3}
+
+    results = {}
+    for c, (name, h) in enumerate(channels.items()):
+        ss = np.random.SeedSequence([1, c])              # master seed 1, one branch per channel
+        rngs = [np.random.default_rng(s) for s in ss.spawn(len(snr_list))]   # independent stream per point
+        ber = np.zeros(len(snr_list))
+        print(f"--- {name} ---")
+        for i, (snr_db, rng) in enumerate(zip(snr_list, rngs)):
+            ber[i], err, n_bits = ber_point(snr_db, h, rng)
+            ber_th, _ = theory_16qam(sinr_eff_db(snr_db, h)[0])   # 16-QAM theory at the effective SINR
+            print(f"Es/N0 {snr_db:4.1f} dB  BER {ber[i]:.3e}  errors {err:5d}  bits {n_bits:8d}"
+                  f"  ratio to theory at SINR_eff {ber[i] / ber_th:.3f}")
+        results[name] = ber
+
+    np.savez("ber_python.npz", snr=snr_list, ber_flat=results["flat"], ber_3tap=results["3tap"])
+
+    snr_fine = np.linspace(0, 18, 181)
+    plt.semilogy(snr_fine, theory_16qam(snr_fine)[0], "k-", label="16-QAM AWGN theory")
+    plt.semilogy(snr_fine, theory_16qam(sinr_eff_db(snr_fine, h3))[0], "k--",
+                 label="16-QAM theory at 3-tap SINR_eff (Gaussian approx.)")
+    plt.semilogy(snr_list, results["flat"], "o", label="Python, flat h=[1], LMMSE")
+    plt.semilogy(snr_list, results["3tap"], "s", mfc="none", label="Python, 3-tap, LMMSE")
+    plt.xlabel("Es/N0 (dB)")
+    plt.ylabel("BER")
+    plt.title("Uncoded DFT-s-OFDM, 16-QAM, 50 PRB, perfect CSI")
+    plt.grid(True, which="both", alpha=0.3)
+    plt.legend()
+    plt.savefig("ber_day5.png", dpi=150, bbox_inches="tight")
+    print("saved ber_python.npz and ber_day5.png")
